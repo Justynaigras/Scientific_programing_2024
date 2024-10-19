@@ -1,0 +1,1365 @@
+---
+title: "Final_project_scientific_programming"
+author: "Justyna Igras"
+date: "2024-09-05"
+---
+##Set-up
+#Instaling packages
+All the packages required are specified below. Please un-comment and install ones you need.
+```{r}
+#install.packages("BiocManager")
+#install.packages("rstudioapi")
+#install.packages("dplyr")
+#install.packages("readxl")
+#install.packages("ggplot2")
+#install.packages("GGally")
+#install.packages("naniar")
+#install.packages("rospca")
+#install.packages("isotree")
+#install.packages("reshape2")
+#install.packages("doParallel")
+#install.packages("data.table")
+#install.packages("sva")
+#install.packages("caret")
+#install.packages("cowplot")
+#BiocManager::install("biomaRt")
+#BiocManager::install("Biobase")
+#BiocManager::install("GEOquery")
+#BiocManager::install("pcaMethods")
+#BiocManager::install("edgeR")
+#BiocManager::install("clusterProfiler")
+#BiocManager::install("enrichplot")
+#BiocManager::install("org.Hs.eg.db")
+```
+
+#Loading packages
+```{r}
+library(dplyr)
+library(biomaRt)
+library(Biobase)
+library(GEOquery)
+library(readxl)
+library(pcaMethods)
+library(ggplot2)
+library(GGally)
+library(naniar)
+library(rospca)
+library(edgeR)
+library(isotree)
+library(reshape2)
+library(doParallel)
+library(data.table)
+library(sva)
+library(clusterProfiler)
+library(enrichplot)
+library(caret)
+library(org.Hs.eg.db)
+library(gridExtra)
+library(cowplot)
+library(rstudioapi)
+```
+
+#Setting plot theme
+```{r}
+theme_plots <- theme_minimal() +
+  theme(text = element_text(size = 12, color = "black"),
+        axis.text = element_text(color = "#404040"),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = 'white',color = 'white'),
+        plot.background  = element_rect(fill = 'white',color = 'white'))
+
+theme_set(theme_plots)
+```
+
+##Loading in the data
+```{r}
+#setting the working directories
+path_file <- dirname(getSourceEditorContext()$path)
+path_data <- file.path(path_file,"Data")
+path_res <- file.path(path_file, "Results")
+
+setwd(path_data)
+#loading RNA-seq data
+#data that includes healthy samples
+healthy_data <- fread("healthy_data.csv")
+
+#data with only diseased
+disease_data <- fread("disease_data.csv") %>%
+  dplyr::rename(ensembl_gene_id = Gene)
+
+#loading phenotype data
+#with healthy samples
+gde121212 <- getGEO("GSE121212", destdir=".")
+pheno_data_healthy_raw <- gde121212[[1]]
+pheno_data_healthy <- pData(pheno_data_healthy_raw) %>%
+  filter(`patient's condition:ch1` == "CTRL" | `patient's condition:ch1` == "AD" )
+
+#only diseased samples
+gde157194 <- getGEO('GSE157194', destdir=".")
+pheno_data_AD_raw <- gde157194[[1]]
+pheno_data_AD <- pData(pheno_data_AD_raw)
+```
+##Binding data from both studies
+#Binding phenotype information
+```{r}
+pheno_data_all <- pheno_data_AD %>%
+  bind_rows(pheno_data_healthy) %>%
+  dplyr::select(title,
+                geo_accession,source_name_ch1,
+                characteristics_ch1.1,
+                characteristics_ch1.2)
+```
+
+#Binding RNA-seq expression data
+```{r}
+#since the data sets use different gene name format both are mapped into ensemble ID in order to merge them
+healthy_data <- healthy_data %>%
+  dplyr::rename(external_gene_name = gene_name)
+
+ensemble_con <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_name <- healthy_data$external_gene_name
+
+#additional data is retrieved from the appropriate data set with database
+add_gene_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                       filters = "external_gene_name",
+                       values = gene_name,
+                       mart = ensemble_con)
+#data is bound together 
+all_data <- add_gene_info %>%
+  full_join(healthy_data, by = c("external_gene_name")) %>%
+  dplyr::select(c(all_of(pheno_data_healthy$title),ensembl_gene_id)) %>%
+  full_join(disease_data,by = c("ensembl_gene_id")) %>%
+  relocate(ensembl_gene_id) %>%
+  t() %>%
+  as.data.frame()
+
+#deleting the genes with no ensemble ID
+colnames(all_data) <- all_data[1,]
+columns_to_keep <- sapply(all_data, function(x) { !is.na(x[[1]]) })
+
+all_data <- all_data[, columns_to_keep]
+all_data <- all_data[-1,]
+```
+
+##Data cleaning
+#Duplicates
+```{r}
+#checking for duplicates in phenotype data
+if (nrow(pheno_data_all) == length(unique(pheno_data_all$geo_accession))) {
+  print("There are no duplicates")
+} else {
+  print("There are duplicates")
+}
+
+#checking for duplicates in RNA-seq data
+if (length(rownames(all_data)) == length(pheno_data_all$title)) {
+  print("Number of samples in phenotype data matches the number od samples in RNA-seq data set")
+} else {
+  print("Number of samples in phenotype data doesn't matches the number od samples in RNA-seq data set")
+}
+
+#checking if any rows are duplicates 
+print(paste("Are there any duplicated rows:", unique(duplicated(all_data))))
+```
+
+#Inconsistencies
+This data has a lot of inconsistencies in terms of naming, which are solved below.
+```{r}
+unique(pheno_data_all$characteristics_ch1.1)
+unique(pheno_data_all$characteristics_ch1.2)
+
+#since phenotype data is formatted weirdly it is mutated to make it easier to use
+pheno_data_all <- pheno_data_all %>%
+  mutate(disease_status = as.factor(if_else(
+    characteristics_ch1.1 == 
+      "disease state: atopic dermatitis" | grepl("AD", title), 
+    "AD", "healthy")),
+    
+    timepoint = as.factor(if_else(
+      characteristics_ch1.2 == 
+        "timepoint: baseline (m0)"| grepl("AD", title), 
+      "baseline" , "after treatment", 
+      missing = "healthy")),
+    
+    treatment = as.factor(if_else(
+      grepl("dupi", source_name_ch1), "dupilumab",
+      if_else(grepl("cy", source_name_ch1), 
+              "cyclosporine", "none"))),
+    
+    disease_state = as.factor(if_else(
+      grepl("AN", title) | grepl("non",title), "non-leasion", 
+      if_else(grepl("AL", title) | grepl("lesion", title), 
+              "lesional", "healthy"))),
+    
+    batch = as.factor(if_else(
+      grepl("AD", title) | grepl("CTRL",title), "Batch 1","Batch 2"))) %>%
+  
+  dplyr::select(-characteristics_ch1.1, 
+                -characteristics_ch1.2, 
+                -source_name_ch1) %>%
+  filter(!(treatment == "cyclosporine")) %>%
+  filter(!(grepl("chronic", title)))
+
+
+all_data <- all_data %>%
+  filter(rownames(.) %in% pheno_data_all$title)
+```
+
+#Missing values
+```{r}
+#checking missing values per gene
+m_per_gene <- apply(all_data, 2, function(col) sum(is.na(col)) / length(col))
+
+print(paste("Number of genes with no missing values:",
+            length(which(m_per_gene == 0))))
+print(paste("Number of genes with less then 30% missing values:",
+            length(which(m_per_gene < 0.3))))
+
+#plotting pattern of missing values
+all_data_pl <- as.data.frame(all_data[,(
+  apply(all_data, 2, function(col) sum(is.na(col)) / length(col)) != 0)]) %>%
+  mutate(title = rownames(all_data)) %>%
+  full_join(pheno_data_all) %>%
+  dplyr::select(-title, 
+                -geo_accession, 
+                -timepoint, 
+                -treatment, 
+                -disease_state)
+
+miss_val <- vis_miss(as.data.frame(all_data_pl[-1,]), warn_large_data = FALSE,
+                     sort_miss = TRUE, facet = batch, show_perc = FALSE) +
+  scale_fill_manual(name = "", labels = c("Not-missing", "Missing"),
+                    values = c("#fce1cc", "#4e0101") )+
+  labs(y = "Number of observations") +
+  theme_plots + theme(axis.text.x = element_blank(),
+                      axis.ticks = element_blank())
+
+#since all missing values are result of merging the data sets all columns containing missing values are removed
+all_data_cleaned <- all_data[,(
+  apply(all_data, 2, function(col) sum(is.na(col)) / length(col)) == 0)]
+
+#checking missing values per sample
+m_per_sample <- apply(all_data_cleaned, 1, 
+                      function(col)sum(is.na(col)) / length(col))
+
+print(paste("Number of samples with no missing values :",
+            length(which(m_per_sample == 0))))
+print(paste("Number of samples with less then 30% missing values :",
+            length(which(m_per_sample < 0.3))))
+```
+
+```{r}
+print(miss_val)
+```
+#Normalization
+As the imported RNA-seq data is not numeric so, in preparation for normalization all_data is transformed to be numeric. TMM normalization is used.
+
+```{r}
+#preparation
+NUM_OF_CORES <- 4
+cl <- makeCluster(NUM_OF_CORES)
+registerDoParallel(cl)
+
+all_data_cleaned_num <- foreach(i = 1:nrow(all_data_cleaned), 
+                                .combine = rbind) %dopar%
+  sapply(all_data_cleaned[i,], as.numeric, USE.NAMES = FALSE)
+
+stopCluster(cl)
+
+rownames(all_data_cleaned_num) <- rownames(all_data_cleaned)
+
+#normalization
+data_all_prep <- DGEList(t(all_data_cleaned_num))
+data_all_prep <- calcNormFactors(data_all_prep)
+data_all_nor <- cpm(data_all_prep, log=FALSE)
+
+```
+
+##PCA
+#elbow plot
+This function creates an elbow plot, which can be used to evaluate how many PCs are significant.
+```{r}
+elbow_plt <- function (pca_result) {
+  #pca_results = object containing the PCA results that will be plotted
+  
+  #variance explained is callculated for each of the PCs
+  pc_values <- as.data.frame(pca_result$eigenvalues) %>%
+    dplyr::rename(eigenvalues = `pca_result$eigenvalues`) %>%
+    mutate(per_var = (eigenvalues / sum(eigenvalues)) * 100) %>%
+    mutate(pc = as.numeric(
+      substring(rownames(as.data.frame(pca_result$eigenvalues)),3,4)))
+  
+  #elbow plot is created
+  elbow_plt_all <- ggplot(data = pc_values, aes(x = pc, y = per_var)) +
+    geom_bar(stat = "identity", color = "#e99f86", fill = "#e99f86") +
+    geom_path(aes(x = pc), size = 1, colour = "#fc4f4b") +
+    scale_x_discrete(name = "PC", limits = factor(c(1:10))) +
+    geom_point(size = 3, color = "#fc4f4b") +
+    ylab("Percentage of varience explained")
+  return(elbow_plt_all)
+}
+```
+
+
+This function creates an PC over PC plot.
+```{r}
+PCvsPC_plt <- function(pca_result_sample_info, PCx, PCy, color, shape, color_v, color_n, color_lab, shape_n, shape_lab, pca_results ) {
+  
+  #pca_result_sample_info = data frame containg PCA results and phenotype information
+  #PCx = PC plotted on x axis
+  #PCy = PC plotted on y axis
+  #color  = column which will be mapped to color aesthetic
+  #shape  = column which will be mapped to shape aesthetic
+  #color_v  = vector of color names used for color aesthetic
+  #color_n = name for the legend for color aesthetic
+  #color_lab = labels for the legend for color aesthetic
+  #shape_n = name for the legend for shape aesthetic
+  #shape_lab = labels for the legend for shape aesthetic
+  #pca_results = an object with all the PCA results used to calculate
+  #the variance explained of PCs
+  
+  #the inputs are converted into symbolic expression so they can be passed to ggplot function
+  PCx_s <- sym(PCx)
+  PCy_s <- sym(PCy)
+  color_s <- sym(color)
+  shape_s <- sym(shape)
+  
+  #numbers of PCs are extracted
+  x <- as.numeric(gsub("PC", "", PCx))
+  y <- as.numeric(gsub("PC", "", PCy))
+  
+  #plot is created
+  PCx_PCy <- ggplot(pca_result_sample_info, aes(x = !!PCx_s, y = !!PCy_s,
+                                                color = !!color_s, 
+                                                shape = !!shape_s)) +
+    geom_point(size = 2.5) +
+    scale_color_discrete(name = color_n, labels = color_lab, type = color_v) +
+    scale_shape_discrete(name = shape_n, labels = shape_lab) +
+    xlab(paste0("PC", x, " (",round(
+      (pca_results$eigenvalues[x] / sum(pca_results$eigenvalues))*100, 2), "%)")) +
+    ylab(paste0("PC", y, " (", round(
+      (pca_results$eigenvalues[y] / sum(pca_results$eigenvalues))*100, 2),"%)")) +
+    theme(legend.position = "right",
+          axis.ticks = element_blank(),
+          axis.text = element_blank()) 
+  
+  return(PCx_PCy)
+}
+```
+
+This function creates a plot of all the PCs.
+```{r}
+all_PCs <- function (pca_result_sample_info, nPCs, color, color_v, color_n, color_lab) {
+  #pca_result_sample_info = data frame containg PCA results and phenotype information
+  #nPCs = number of PCs that will be plotted against each other
+  #color  = column which will be mapped to color aesthetic
+  #color_v  = vector of color names used for color aesthetic
+  #color_n = name for the legend for color aesthetic
+  #color_lab = labels for the legend for color aesthetic
+  
+  #the inputs are converted into symbolic expression so they can be passed to ggplot function
+  color_s <- sym(color)
+  
+  #plot is crated
+  all_PC_all <- ggpairs(pca_result_sample_info, columns = 1:nPCs, 
+                        aes(color = !!color_s),
+                        upper = list(continuous = 'blank'),
+                        switch = 'both', legend = 1, progress = FALSE) +
+    scale_fill_discrete(name = color_n, labels = color_lab, type = color_v) +
+    scale_color_manual(values = color_v ) +
+    theme(axis.ticks = element_blank(),
+          axis.text = element_blank())
+}
+```
+
+
+#PCA on all data
+
+```{r}
+#unit variance scaling is done
+data_all_scale <- pcaMethods::prep(t(data_all_nor), scale = "uv")
+pca_result_all<- robpca(data_all_scale, k = 10)
+scores_only_all <- as.data.frame(pca_result_all$scores)
+
+#PCA results are combined with phenotype data
+pca_result_sample_info_all <- scores_only_all %>%
+  mutate(title = row.names(scores_only_all)) %>%
+  full_join(pheno_data_all, by = "title")
+
+#amount of relevant PCs is chosen using elbow plot
+elbow_plt_all <- elbow_plt(pca_result_all)
+
+#PCA results are plotted
+PC1_PC2_all <- PCvsPC_plt(pca_result_sample_info_all,
+                          "PC1", "PC2", "batch", 
+                          "disease_status", c("#fc4f4b","#9b4b18")
+                          ,"Batch", c("batch 1", "batch 2"), 
+                          "Disease status", c("AD","healthy"), 
+                          pca_result_all)
+
+all_PC_all <- all_PCs(pca_result_sample_info_all, 5, 
+                      "batch", c("#fc4f4b","#9b4b18"), 
+                      "Batch", c("batch 1", "batch 2"))
+
+
+print(elbow_plt_all)
+print(all_PC_all)
+print(PC1_PC2_all)
+```
+
+#Batch correction
+
+From the PCA we can see that there is a very strong batch effect, due to that batch correction using Combat_seq is performed to minimize it.
+```{r}
+#batch is matched to the sample present in the RNA-seq data
+batch_indices <- match(colnames(data_all_nor), pheno_data_all$title)
+batch <- pheno_data_all$batch[batch_indices]
+
+#batch correction is performed
+data_corrected <- ComBat_seq(counts = data_all_nor, batch = batch)
+```
+#PCA on corrected data
+```{r}
+#unit variance scaling is done
+data_corrected_scaled <- pcaMethods::prep(t(data_corrected), scale = "uv")
+pca_result_cor <- robpca(data_corrected_scaled, k = 10)
+scores_only_cor <- as.data.frame(pca_result_cor$scores)
+
+#PCA results are combined with phenotype data
+pca_result_sample_info_cor <- scores_only_cor %>%
+  mutate(title = row.names(scores_only_cor)) %>%
+  full_join(pheno_data_all, by = "title")
+
+#amount of relevant PCs is chosen using elbow plot
+elbow_plt_cor <- elbow_plt(pca_result_cor)
+
+#PCA results are plotted
+PC1_PC2_cor <- PCvsPC_plt(pca_result_sample_info_cor,
+                          "PC1", "PC2", "batch", 
+                          "disease_status",  c("#fc4f4b","#9b4b18"),
+                          "Batch", c("batch 1", "batch 2"), 
+                          "Disease status", c("AD","healthy"),
+                          pca_result_cor)
+
+all_PC_cor <- all_PCs(pca_result_sample_info_cor, 6, 
+                      "batch", c("#fc4f4b","#9b4b18"), 
+                      "Batch", c("batch 1", "batch 2"))
+
+print(elbow_plt_cor)
+print(all_PC_cor)
+print(PC1_PC2_cor)
+```
+##Checking if any clustering can be seen on the PCs
+
+Plots below are visualizing different phenotypic variables to see if any patterns emerge.
+
+#Healthy vs lesional vs non-lesional
+```{r}
+all_PC_state <- all_PCs(pca_result_sample_info_cor, 6, 
+                        "disease_state", c("#e7b9a9","#9b4b18","#c20201"), 
+                        "Disease state", c("healthy", "lesional","non-lesional"))
+
+PC1_PC2_state <- PCvsPC_plt(pca_result_sample_info_cor,"PC1", "PC2", 
+                            "disease_state", "disease_status", 
+                            c("#e7b9a9","#9b4b18","#c20201"),
+                            "Disease state", 
+                            c("healthy","lesional", "non-lesional"), 
+                            "Disease status", c("AD","healthy"), 
+                            pca_result_cor)
+
+print(all_PC_state)
+print(PC1_PC2_state)
+```
+
+#Healthy vs baseline vs after treatment
+```{r}
+all_PC_time <- all_PCs(pca_result_sample_info_cor, 6, 
+                       "timepoint", c("#e7b9a9","#9b4b18","#fc4f4b"), 
+                       "Timepoint", c("after treatment", "beseline","healthy"))
+
+PC1_PC2_time <- PCvsPC_plt(pca_result_sample_info_cor,"PC1", "PC2", "timepoint", 
+                           "disease_status", c("#e7b9a9","#9b4b18","#fc4f4b"),
+                           "Timepoint", c("after treatment", "beseline","healthy"), 
+                           "Disease status", c("AD","healthy"), 
+                           pca_result_cor)
+
+print(all_PC_time)
+print(PC1_PC2_time)
+```
+
+
+##Outlier detection
+#Isolation forest
+```{r}
+#outliner detection
+is_for_all <- isolation.forest(t(data_corrected))
+#since none of the samples have a high outlier score I decided to use default parameter of isolation forest
+
+outlierscore_all <- predict(is_for_all, t(data_corrected))
+```
+
+Below the results of outlier detection are present. Since the highest outlier score is around 0.55, none of the samples are classified as outliers.
+```{r}
+pca_result_sample_info_out <- as.data.frame(outlierscore_all) %>%
+  mutate(title = row.names(.)) %>%
+  full_join(pca_result_sample_info_cor)
+
+PC1_PC2_out <- ggplot(pca_result_sample_info_out, 
+                      aes(PC1, PC2, color = outlierscore_all)) + 
+  geom_point(size = 2.5) +
+  scale_color_continuous(name = "Outlier score", low = "#e7b9a9", high = "#c20201")+
+  xlab(paste("PC1 explains", round((
+    pca_result_cor$eigenvalues[1] / sum(pca_result_cor$eigenvalues))*100, 2), 
+    "% of the variance")) +
+  ylab(paste("PC2 explains", round((
+    pca_result_cor$eigenvalues[2] / sum(pca_result_cor$eigenvalues))*100, 2),
+    "% of the variance")) +
+  theme(axis.ticks = element_blank(),
+        axis.text = element_blank())
+
+all_PC_out <- ggpairs(pca_result_sample_info_out, columns = 3:7,
+                      aes(color = outlierscore_all),
+                      upper = list(continuous = 'blank'),
+                      switch = 'both', 
+                      legend = grab_legend(PC1_PC2_out), progress = FALSE) +
+  scale_color_continuous(name = "Outlier score", low = "#e7b9a9", high = "#c20201")+
+  theme(axis.ticks = element_blank(),
+        axis.text = element_blank())
+
+print(all_PC_out)
+print(PC1_PC2_out)
+```
+#Diferential gene analysis (DGA)
+##Comparison group preparation
+
+The data for the differential gene analysis is prepared for each of the 4 comparisons.
+```{r}
+#lesional vs non-lesional at baseline
+pheno_data_comp_b <- pheno_data_all %>%
+  filter(timepoint == "baseline")
+
+data_comp_b <- as.data.frame(data_corrected) %>%
+  dplyr::select(one_of(pheno_data_comp_b$title))
+
+#lesional before vs after treatment
+pheno_data_comp_l <- pheno_data_all %>%
+  filter(disease_state == "lesional")
+
+data_comp_l <- as.data.frame(data_corrected) %>%
+  dplyr::select(one_of(pheno_data_comp_l$title))
+
+#non-leasional before vs after treatment
+pheno_data_comp_n <- pheno_data_all %>%
+  filter(disease_state == "non-leasion")
+
+data_comp_n <- as.data.frame(data_corrected) %>%
+  dplyr::select(one_of(pheno_data_comp_n$title))
+
+#healthy vs baseline
+pheno_data_comp_hb <- pheno_data_all %>%
+  filter(timepoint == "baseline" | timepoint == "healthy")
+
+data_comp_hb <- as.data.frame(data_corrected) %>%
+  dplyr::select(one_of(pheno_data_comp_hb$title))
+```
+
+##Pipeline of DGA
+Since even after batch correction the batches can be clearly seen on the PCA,batch is used as co-variate to further correct for its effect.
+
+#without repetition
+This function performs differential gene analysis using edgeR package. The result is a data frame with logFC, logCpm, F, pValue, FDR.
+```{r}
+dga <- function (seq_data, pheno_data, comp_group, ref = "baseline") {
+  #seq_data = sequencing data
+  #pheno_data = phenotype data
+  #comp_group = vector in which the comparison groups are noted
+  #ref = reference group
+  
+  #groups and batches are matched between the phenotype data and RNA-seq data
+  groups_match <- match(colnames(seq_data), pheno_data$title)
+  group <- factor(comp_group[groups_match])
+  group <- relevel(group, ref = ref)
+  
+  batch_match <- match(colnames(seq_data), pheno_data$batch)
+  batch <- factor(pheno_data$batch[groups_match])
+  
+  dge_comp <- DGEList(seq_data, group = group)
+  #lowly expressed genes are filtered
+  keep <- filterByExpr(dge_comp, group = group)
+  
+  #the comparison groups are denoted in a design matrix
+  desing_1 <- model.matrix( ~ group + batch)
+  dge_comp <- estimateDisp(dge_comp, desing_1)
+  
+  
+  #genalized linear model is fit
+  fit <- glmQLFit(dge_comp, desing_1)
+  
+  deg <- glmQLFTest(fit, coef = 2)
+  
+  #all differently expressed genes (DGES) are returned 
+  deg_raw <- as.data.frame(topTags(deg, n = nrow(dge_comp$counts))) 
+  
+  deg_raw <- deg_raw %>%
+    mutate(ensembl_gene_id = rownames(deg_raw))%>%
+    inner_join(add_gene_info)
+  
+  return(deg_raw)
+}
+```
+
+#with repetition
+This function performs differential gene analysis using edgeR package with repetition using up-sampling. This method is used to account for the imbalance between the groups. The result is a data frame with median logFC, QDlogFC, median logCpm, QDlogCpm, median F, QDF, median pValue, QDpValue, median FDR, QDFDR.
+```{r}
+dga_up_samp <- function (seq_data, pheno_data, comp_group, ref, rep = 1) {
+  #seq_data = sequencing data
+  #pheno_data = phenotype data
+  #comp_group = vector in which the comparison groups are noted
+  #ref = reference group
+  #rep = number of repetitions of differential gene analysis
+  
+  #storage objects for LogFC, logCPM, F, PValue and FDR are created
+  l_fc <- data.frame(ensembl_gene_id = row.names(seq_data))
+  l_cpm <- data.frame(ensembl_gene_id = row.names(seq_data))
+  f <- data.frame(ensembl_gene_id = row.names(seq_data))
+  p_v <- data.frame(ensembl_gene_id = row.names(seq_data))
+  ad_fdr <- data.frame(ensembl_gene_id = row.names(seq_data))
+  
+  #parallel cluster is initiated
+  NUM_OF_CORES <- 4
+  cl <- makeCluster(NUM_OF_CORES)
+  registerDoParallel(cl)
+  
+  
+  res_it <- foreach(i = 1:rep, .packages = c("dplyr", "edgeR", "caret"), 
+                    .export = c("dga","add_gene_info")) %dopar% 
+    {
+    #data is transposed for proper up-sampling
+    prep_data <- as.data.frame(t(seq_data)) %>%
+      mutate(title = rownames(t(seq_data)))
+    
+    #data is up-sampled so the 2 classes have equal amount of samples
+    up_samp <- upSample(prep_data, comp_group)
+    up_samp_name <- up_samp$title
+    up_samp <- up_samp %>%
+      dplyr::select(-title, -Class)
+    up_samp <- t(up_samp)
+    colnames(up_samp) <- up_samp_name
+    
+    #differential analysis is done using edgeR pipeline (further described in dga function)
+    deg_up <- dga(up_samp, pheno_data, comp_group, ref)
+    
+    #results are split into separate data frames
+    l_fc_per_it <- deg_up %>%
+      dplyr::select(-logCPM, -'F',-PValue, -FDR, -external_gene_name) %>%
+      rename_with(.cols = logFC, .fn = ~ paste0("logFC", i))
+    
+    l_cpm_per_it <- deg_up %>%
+      dplyr::select(-logFC, -'F', -PValue, -FDR, -external_gene_name) %>%
+      rename_with(.cols = logCPM, .fn = ~ paste0("CPM", i))
+    
+    f_per_it <- deg_up %>%
+      dplyr::select(-logCPM, -logFC, -PValue, -FDR, -external_gene_name) %>%
+      rename_with(.cols = 'F', .fn = ~ paste0("F", i))
+    
+    p_v_per_it <- deg_up %>%
+      dplyr::select(-logCPM, -'F', -logFC, -FDR, -external_gene_name) %>%
+      rename_with(.cols = PValue, .fn = ~ paste0("p_V", i))
+    
+    ad_fdr_per_it <- deg_up %>%
+      dplyr::select(-logCPM, -'F', -PValue,-logFC , -external_gene_name) %>%
+      rename_with(.cols = FDR, .fn = ~ paste0("ad_fdr", i))
+    res <- list(l_fc_per_it, l_cpm_per_it, f_per_it, p_v_per_it, ad_fdr_per_it)
+  }
+  
+  stopCluster(cl)
+  
+  #results from all iterations are combined
+  for (j in 1: length(res_it)) {
+    l_fc <- l_fc %>%
+      left_join(res_it[[j]][[1]], by = join_by(ensembl_gene_id))
+    l_cpm <- l_cpm %>%
+      left_join(res_it[[j]][[2]], by = join_by(ensembl_gene_id))
+    f <- f %>%
+      left_join(res_it[[j]][[3]], by = join_by(ensembl_gene_id))
+    p_v <- p_v %>%
+      left_join(res_it[[j]][[4]], by = join_by(ensembl_gene_id))
+    ad_fdr <- ad_fdr %>%
+      left_join(res_it[[j]][[5]], by = join_by(ensembl_gene_id))
+  }
+  
+  #all results from all iterations are summarized using median and quantile deviation
+  l_fc <- l_fc %>%
+    rowwise() %>%
+    mutate(logFC = median(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+    mutate(QDlogFC = 
+             (quantile((c_across(where(is.numeric))), probs = 0.75) -
+                quantile(c_across(where(is.numeric)), probs = 0.25))/ 2) %>%
+    ungroup() %>%
+    dplyr::select(ensembl_gene_id, logFC, QDlogFC) %>%
+    filter(!is.na(logFC))
+  
+  l_cpm <- l_cpm %>%
+    rowwise() %>%
+    mutate(logCPM = median(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+    mutate(QDlogCPM = 
+             (quantile((c_across(where(is.numeric))), probs = 0.75) -
+                quantile(c_across(where(is.numeric)), probs = 0.25))/ 2) %>%
+    ungroup() %>%
+    dplyr::select(ensembl_gene_id, logCPM, QDlogCPM)%>%
+    filter(!is.na(logCPM))
+  
+  f <- f %>%
+    rowwise() %>%
+    mutate('F' = median(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+    mutate(QDF = 
+             (quantile((c_across(where(is.numeric))), probs = 0.75) -
+                quantile(c_across(where(is.numeric)), probs = 0.25))/ 2) %>%
+    ungroup() %>%
+    dplyr::select(ensembl_gene_id, 'F', QDF)%>%
+    filter(!is.na('F'))
+  
+  p_v <- p_v %>%
+    rowwise() %>%
+    mutate(PValue = median(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+    mutate(QDPValues = 
+             (quantile((c_across(where(is.numeric))), probs = 0.75) -
+                quantile(c_across(where(is.numeric)), probs = 0.25))/ 2) %>%
+    ungroup() %>%
+    dplyr::select(ensembl_gene_id, PValue, QDPValues)%>%
+    filter(!is.na(PValue))
+  
+  ad_fdr <- ad_fdr %>%
+    rowwise() %>%
+    mutate(FDR = median(c_across(where(is.numeric)), na.rm = TRUE)) %>%
+    mutate(QDFDR = 
+             (quantile((c_across(where(is.numeric))), probs = 0.75) -
+                quantile(c_across(where(is.numeric)), probs = 0.25))/ 2) %>%
+    ungroup() %>%
+    dplyr::select(ensembl_gene_id, FDR, QDFDR)%>%
+    filter(!is.na(FDR))
+  
+  #all the results are joined
+  results <- l_fc %>%
+    left_join(l_cpm) %>%
+    left_join(f) %>%
+    left_join(p_v) %>%
+    left_join(ad_fdr)
+  
+  return(results)
+}
+```
+
+##DGA of earlier prepared comparison groups
+```{r}
+#lesional vs non-lesional at baseline
+deg_b <- dga(data_comp_b, pheno_data_comp_b, pheno_data_comp_b$disease_state, 
+             ref = "non-leasion")
+```
+
+If you decide to run this part of the script with the full data and a lot of repetitions then it takes a few hours. If you just want to test the code function please set the variable test to TRUE. Then each comparison will be run three times on a sample of 50 randomly chosen samples and 1000 randomly selected genes.
+
+```{r}
+setwd(path_data)
+test = TRUE
+
+if (test == TRUE) {
+  pheno_data_comp_b_test <- pheno_data_comp_b %>%
+    sample_n(50)
+  
+  data_comp_b_test <- as.data.frame(data_corrected) %>%
+    dplyr::select(one_of(pheno_data_comp_b_test$title)) %>%
+    sample_n(1000)
+  
+  #lesional before vs after treatment
+  pheno_data_comp_l_test <- pheno_data_comp_l %>%
+    sample_n(50)
+  
+  data_comp_l_test <- as.data.frame(data_corrected) %>%
+    dplyr::select(one_of(pheno_data_comp_l_test$title)) %>%
+    sample_n(1000)
+  
+  #non-leasional before vs after treatment
+  pheno_data_comp_n_test <- pheno_data_comp_n %>%
+    sample_n(50)
+  
+  data_comp_n_test <- as.data.frame(data_corrected) %>%
+    dplyr::select(one_of(pheno_data_comp_n_test$title)) %>%
+    sample_n(1000)
+  
+  #healthy vs baseline
+  pheno_data_comp_hb_test <- pheno_data_comp_hb %>%
+    sample_n(50)
+  
+  data_comp_hb_test <- as.data.frame(data_corrected) %>%
+    dplyr::select(one_of(pheno_data_comp_hb_test$title)) %>%
+    sample_n(1000)
+  
+  #lesional before vs after treatment
+  deg_l <- dga_up_samp(data_comp_l_test, pheno_data_comp_l_test,
+                       pheno_data_comp_l_test$timepoint, 
+                       ref = "baseline", rep = 3)
+  #non-leasional before vs after treatment
+  deg_n <- dga_up_samp(data_comp_n_test, pheno_data_comp_n_test,
+                       pheno_data_comp_n_test$timepoint, 
+                       ref = "baseline", rep = 3)
+  #healthy vs baseline
+  deg_hb <- dga_up_samp(data_comp_hb_test, pheno_data_comp_hb_test, 
+                        pheno_data_comp_hb_test$disease_status, 
+                        ref = "healthy", rep = 3)
+  
+  #saving the results as RData
+  save(deg_b, deg_l, deg_n, deg_hb, file ="final_res.RData")
+}
+```
+
+```{r}
+setwd(path_data)
+if (test == FALSE) {
+  #lesional before vs after treatment
+  deg_l <- dga_up_samp(data_comp_l, pheno_data_comp_l, pheno_data_comp_l$timepoint, 
+                       ref = "baseline", rep = 100)
+  #non-leasional before vs after treatment
+  deg_n <- dga_up_samp(data_comp_n, pheno_data_comp_n, pheno_data_comp_n$timepoint, 
+                       ref = "baseline", rep = 100)
+  #healthy vs baseline
+  deg_hb <- dga_up_samp(data_comp_hb, pheno_data_comp_hb, 
+                        pheno_data_comp_hb$disease_status, 
+                        ref = "healthy", rep = 100)
+  
+  #saving the results as RData
+  save(deg_b, deg_l, deg_n, deg_hb, file ="final_res.RData")
+}
+```
+
+##Visualizations
+
+#Quality control plots
+In order to make the results more significant the highly variable genes that are close to the thresholds set are filtered out. The results of this are visualized using the function below.
+```{r}
+qc_plots <- function (deg_up, FC, fdr) {
+  
+  #deg_up = differential gene analysis results
+  #FC = log fold threshold
+  #fdr = false discovery rate threshold
+  
+  #differently expressed genes are filtered based on logFC
+  deg_up_filtered <- deg_up %>%
+    filter(abs(logFC) > FC) %>%
+    mutate(gene_type = case_when(abs(logFC) > (FC + QDlogFC) ~ "up",
+                                 abs(logFC) < (FC + QDlogFC) ~ "down"))
+  
+  #color are set up
+  cols <- c("up" = "#fc4f4b", "down" = "#e7b9a9") 
+           
+  #FC plot is created       
+  FC_plt <- ggplot(deg_up_filtered, 
+                   aes(x = QDlogFC, y = abs(logFC), color = gene_type)) +
+    geom_point(size = 2) +
+    geom_function(fun = ~ FC + .x, color = "#9b4b18", linewidth = 1) +
+    scale_color_manual(values = cols) +
+    ylim(c(FC, (FC + 0.5))) +
+    labs(x = "QDlogFC",
+         y = "abs(logFC)") +
+    theme(legend.position = "bottom")
+  
+  #differently expressed genes are filtered based on FDR
+  deg_up_filtered_FDR <- deg_up %>%
+    filter(FDR < fdr) %>%
+    mutate(gene_type = case_when(FDR < (fdr - QDFDR) ~ "up",
+                                 FDR > (fdr - QDFDR) ~ "down"))
+  
+  #FC plot is created 
+  FDR_plt <- ggplot(deg_up_filtered_FDR, 
+                    aes(x = QDFDR, y = FDR, color = gene_type)) +
+    geom_point(size = 2) +
+    geom_function(fun = ~ fdr - .x, color = "#9b4b18", linewidth = 1) +
+    scale_color_manual(name = "Threshold", values = cols, 
+                       labels = c("removed","stay")) +
+    ylim(c(0, fdr)) +
+    labs(x = "QDFDR",
+         y = "FDR") +
+    theme(legend.position = "bottom")
+  
+  #both plots are put onto grid
+  final_plt <- plot_grid(FC_plt, FDR_plt, ncol = 2) + 
+    coord_cartesian(clip = "off")
+    
+  return(final_plt)
+}
+```
+
+```{r}
+filter_qc <- function (deg_up, FC, fdr) {
+  #deg_up = differential gene analysis results
+  #FC = log fold threshold
+  #fdr = false discovery rate threshold
+  
+  #genes below threshold are filtered
+  filtered_fc <- deg_up %>%
+    filter(abs(logFC) < FC)
+  filtered_FDR <- deg_up %>%
+    filter(FDR > fdr)
+  
+  #highly variable genes are filtered out
+  filtered_all <-  deg_up %>%
+    filter(abs(logFC) > (FC + QDlogFC)) %>%
+    filter(FDR < (fdr - QDFDR)) %>%
+    rbind(filtered_fc, filtered_FDR) 
+  
+  return(filtered_all)
+}
+```
+
+#Volcano plot
+```{r}
+vol_plt <- function (degs, FC, fdr = 0.05) {
+  
+  #degs = differently expressed genes data frame
+  #FC = cut-off log fold change, to be considered significant
+  #fdr - cut-off false discovery rate, to be considered significant
+  
+  #DEGS are classified into up and down-regulated, as well as not significant
+  deg_pl <- degs %>%
+    mutate(gene_type = case_when(logFC >= FC & FDR <= fdr ~ "up",
+                                 logFC <= -FC & FDR <= fdr ~ "down",
+                                 TRUE ~ "ns"))   
+  
+  cols <- c("up" = "#c20201", "down" = "#C5E0F4", "ns" = "#fce1cc") 
+  sizes <- c("up" = 2, "down" = 2, "ns" = 1) 
+  alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+  
+  #volcano plot is generated
+  vol_plot <- deg_pl %>%
+    ggplot(aes(x = logFC,
+               y = -log10(FDR),
+               fill = gene_type,
+               size = gene_type,
+               alpha = gene_type)) + 
+    geom_point(shape = 21, colour = "#380101") +
+    geom_hline(yintercept = -log10(fdr), linetype = "dashed") + 
+    geom_vline(xintercept = c(-FC, FC), linetype = "dashed") +
+    scale_fill_manual(name = "Category", values = cols,
+                      labels = 
+                        c("Downregulated", "Not-significant", "Upregulated")) + 
+    scale_size_manual(name = "Category",values = sizes,
+                      labels = 
+                        c("Downregulated", "Not-significant", "Upregulated")) + 
+    scale_alpha_manual(name = "Category",values = alphas,
+                       labels = 
+                         c("Downregulated", "Not-significant", "Upregulated")) 
+  
+  return(vol_plot)
+}
+```
+
+#Filtering the result of imbalanced comparisons
+
+```{r}
+gc_deg_l <- qc_plots(deg_l, 1, 0.05)
+gc_deg_n <- qc_plots(deg_n, 1, 0.05)
+gc_deg_hb <- qc_plots(deg_hb, 1, 0.05)
+
+filter_deg_l <- filter_qc(deg_l, 1, 0.05)
+filter_deg_n <- filter_qc(deg_n, 1, 0.05)
+filter_deg_hb <- filter_qc(deg_hb,1, 0.05)
+
+#plot baseline vs after treatment (lesional)
+print(gc_deg_l)
+```
+
+
+```{r}
+#plot baseline vs after treatment (non-lesional)
+print(gc_deg_n)
+```
+
+
+```{r}
+#plot healthy vs baseline AD
+print(gc_deg_hb)
+```
+
+```{r}
+#volcano plots are every comparison are made
+deg_b_vol <- vol_plt(deg_b, 1)
+deg_l_vol <- vol_plt(filter_deg_l, 1)
+deg_n_vol <- vol_plt(filter_deg_n, 1)
+deg_hb_vol <- vol_plt(filter_deg_hb, 1)
+
+#plot lesional vs non-lesional at baseline
+print(deg_b_vol)
+```
+
+```{r}
+#plot baseline vs after treatment (lesional)
+print(deg_l_vol)
+```
+
+```{r}
+#plot baseline vs after treatment (non-lesional)
+print(deg_n_vol)
+```
+
+```{r}
+#plot healthy vs baseline AD
+print(deg_hb_vol)
+```
+
+
+#Pathway enrichment
+To visualize what the differential expressed gene set enrichment pathway analysis using GO Terms (further reffered to as go analysis) is performed.
+
+Function below performers the pathway enrichment analysis. The results are corrected for multiple testing using bonfereni correction.
+```{r}
+go_analysis <- function(deg, FC, fdr = 0.05) {
+
+  #deg = data frame of differential genes
+  #FC = cut-off log fold change, to be considered significant
+  #FDR - cut-off false discovery rate, to be considered significant
+
+  #Significant genes are filtered
+  kegg <- deg %>%
+    filter(FDR < fdr) %>% 
+    filter(logFC > FC | logFC < -FC) %>%
+    dplyr::select(ensembl_gene_id, logFC)
+  
+  #Convert to numeric vector
+  gene_list <- as.numeric(kegg$logFC)
+  names(gene_list) <- kegg$ensembl_gene_id
+  
+  
+  #Sort genes based on logFC
+  gene_list <- sort(gene_list, decreasing = TRUE)
+  
+  #Perform GO pathway enrichment
+  kk2 <- gseGO(geneList    = gene_list,
+              OrgDb        = org.Hs.eg.db,
+              keyType = "ENSEMBL",
+              ont          = "MF",
+              minGSSize    =10,
+              maxGSSize    = 500,
+              pvalueCutoff = 0.05,
+              verbose      = FALSE,
+              pAdjustMethod = "BH")
+
+  return(kk2)
+}
+```
+
+
+```{r}
+#go analysis for each comparison is performed
+
+#lesional vs non-lesional at baseline
+path_deg_b <- go_analysis(deg_b, 1)
+
+#baseline vs after treatment (lesional)
+path_deg_l <- go_analysis(filter_deg_l, 1)
+
+#baseline vs after treatment (non-lesional)
+path_deg_n <- go_analysis(filter_deg_n, 1)
+
+#healthy vs baseline AD
+path_deg_hb <- go_analysis(filter_deg_hb, 1)
+```
+Plot for baseline vs after treatment (non-lesional) is not created as no pathways were found to be enriched.
+```{r}
+#color scale is set
+options(enrichplot.colours = c("#C5E0F4","#c20201"))
+
+#lesional vs non-lesional at baseline
+path_plt_deg_b <- clusterProfiler::dotplot(path_deg_b, showCategory = 8, 
+                                           title = "Enriched Pathways" ,
+                                           split= ".sign") +
+  facet_grid(.~.sign) +
+  theme_bw() +
+  theme(text = element_text(size = 12, color = "black"),
+        axis.text = element_text(color = "#404040"),
+        panel.grid = element_blank(),
+        panel.background = element_rect(fill = 'white',color = 'white'),
+        plot.background  = element_rect(fill = 'white',color = 'white'),
+        legend.background = element_rect(fill = 'white',color = 'white'))
+
+if (test == FALSE) { 
+  #since during test we are talking a tiny sample no pathways are found
+  #to be enriched therefore these plots are not created
+  
+  #baseline vs after treatment (lesional)
+  path_plt_deg_l <- clusterProfiler::dotplot(path_deg_l, showCategory = 8, 
+                                             title = "Enriched Pathways" , 
+                                             split= ".sign") +
+    facet_grid(.~.sign) +
+    theme_bw() +
+    theme(text = element_text(size = 12, color = "black"),
+          axis.text = element_text(color = "#404040"),
+          panel.grid = element_blank(),
+          panel.background = element_rect(fill = 'white',color = 'white'),
+          plot.background  = element_rect(fill = 'white',color = 'white'),
+          legend.background = element_rect(fill = 'white',color = 'white'))
+  
+  #healthy vs baseline AD
+  path_plt_deg_hb <- clusterProfiler::dotplot(path_deg_hb, showCategory = 8, 
+                                              title = "Enriched Pathways" , 
+                                              split= ".sign") +
+    facet_grid(.~.sign) +
+    theme_bw() +
+    theme(text = element_text(size = 12, color = "black"),
+          axis.text = element_text(color = "#404040"),
+          panel.grid = element_blank(),
+          panel.background = element_rect(fill = 'white',color = 'white'),
+          plot.background  = element_rect(fill = 'white',color = 'white'),
+          legend.background = element_rect(fill = 'white',color = 'white'))
+}
+```
+#Treatment assesment
+
+To see if the treatment converges the transcriptome closer to healthy transcriptome or to baseline AD transcriptome.
+
+Here we look at first 20 most differential expressed genes (between healthy and baseline AD) and see the differences between mean counts between the 3 groups.
+```{r}
+#the differentialy expressed genes are filtered
+filtered_deg_hb <- filter_deg_hb %>%
+  filter((abs(logFC) > 1) & (FDR < 0.05))
+
+#top 20 genes are chosen
+top_20_genes <- filtered_deg_hb %>%
+  mutate(abs_logFC = abs(logFC)) %>%
+  arrange(desc(abs_logFC)) %>%
+  head(20)
+
+filtered_all_data <- as.data.frame(t(data_corrected)) %>%
+  dplyr::select(matches(top_20_genes$ensembl_gene_id))
+
+#sample names for each of the groups are saved
+healthy_samp_name <- pheno_data_all %>%
+  filter(disease_status == "healthy") %>%
+  dplyr::select(title)
+
+baseline_samp_name <- pheno_data_all %>%
+  filter(timepoint == "baseline") %>%
+  dplyr::select(title)
+
+after_samp_name <- pheno_data_all %>%
+  filter(timepoint == "after treatment") %>%
+  dplyr::select(title)
+
+#mean counts for each of the genes per group are calculated
+healthy_ex_20 <- as.data.frame(filtered_all_data) %>%
+  mutate(title = rownames(filtered_all_data)) %>%
+  filter(title %in% healthy_samp_name$title) %>%
+  dplyr::select(-title) %>%
+  apply(MARGIN = 2, FUN = mean) %>%
+  as.data.frame()
+
+healthy_ex_20$ensembl_gene_id <- rownames(healthy_ex_20)
+
+healthy_ex_20 <- healthy_ex_20 %>%
+  left_join(add_gene_info)
+
+baseline_ex_20 <- as.data.frame(filtered_all_data) %>%
+  mutate(title = rownames(filtered_all_data)) %>%
+  filter(title %in% baseline_samp_name$title) %>%
+  dplyr::select(-title) %>%
+  apply(MARGIN = 2, FUN = mean) %>%
+  as.data.frame()
+
+baseline_ex_20$ensembl_gene_id <- rownames(baseline_ex_20)
+
+baseline_ex_20 <- baseline_ex_20 %>%
+  left_join(add_gene_info)
+
+after_ex_20 <- as.data.frame(filtered_all_data) %>%
+  mutate(title = rownames(filtered_all_data)) %>%
+  filter(title %in% after_samp_name$title) %>%
+  dplyr::select(-title) %>%
+  apply(MARGIN = 2, FUN = mean) %>%
+  as.data.frame()
+
+after_ex_20$ensembl_gene_id <- rownames(after_ex_20)
+
+after_ex_20 <- after_ex_20 %>%
+  left_join(add_gene_info)
+
+#the mean counts per group are plotted
+top_20_plt <- ggplot() +
+  geom_point(data = healthy_ex_20, 
+             aes(x = external_gene_name, y = ., color = "Healthy")) +
+  geom_point(data = baseline_ex_20, 
+             aes(x = external_gene_name, y = ., color = "Baseline")) +
+  geom_point(data = after_ex_20, 
+             aes(x = external_gene_name, y = ., color = "After")) +
+  scale_color_manual(name = "Timepoint",
+                     values = c("Healthy" = "#e7b9a9",
+                                "Baseline" = "#fc4f4b", 
+                                "After" = "#cc6a2b"),
+                     labels = c("Healthy" = "Healthy",
+                                "Baseline" = "Baseline", 
+                                "After" = "After treatment")) +
+  labs(y = "Mean count", 
+       x = "") +
+  ylim(c(0,400)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.05),
+        panel.grid.major.x = element_line(size = 0.5, color = "lightgrey"))
+
+print(top_20_plt)
+```
+
+To test further PCA only on the differentialy genes between healthy and baseline AD is performed.
+```{r}
+#the differentialy expressed genes are filtered
+filtered_all_data_PC <- as.data.frame(t(data_corrected)) %>%
+  dplyr::select(matches(filtered_deg_hb$ensembl_gene_id))
+
+#unit variate scalling is performed
+data_filtered_scaled <- pcaMethods::prep(filtered_all_data_PC, scale = "uv")
+
+#PCA is performed
+pca_result_fil<- robpca(data_filtered_scaled, k = 10)
+scores_only_fil <- as.data.frame(pca_result_fil$scores)
+
+pca_result_sample_info_fil <- scores_only_fil %>%
+  mutate(title = row.names(scores_only_fil)) %>%
+  full_join(pheno_data_all, by = "title")
+
+#amount of relevant PCs is chosen using elbow plot
+elbow_plt_last <- elbow_plt(pca_result_fil)
+
+#PCA results are plotted
+PC1_PC2_last <- PCvsPC_plt(pca_result_sample_info_fil,
+                           "PC1", "PC2", "timepoint", 
+                           "disease_status", c("#fc4f4b","#9b4b18","#e7b9a9"),
+                          "Timepoint", c("after treatment", "baseline", "healthy"), 
+                          "Disease status", c("AD","healthy"),
+                          pca_result_fil)
+
+all_PC_last <- all_PCs(pca_result_sample_info_cor, 6, 
+                       "timepoint", c("#fc4f4b","#9b4b18", "#e7b9a9"), 
+                       "Timepoint", c("after treatment", "baseline", "healthy"))
+
+print(elbow_plt_last)
+print(all_PC_last)
+print(PC1_PC2_last)
+```
+#Saving the plots
+##Missing values
+```{r}
+# in markdown the global set directory function (root.dir) comes in affect only when the file is knitted, therefore in every chunk where the file is saved new directory for that chunk is set to make sure files are saved in a proper directory (as png function can only save in working directory)
+
+setwd(path_res)
+
+png("Missing_values.png", width = 900, height = 600)
+miss_val
+dev.off()
+```
+
+##PCA uncorrected
+```{r}
+path_PCA_un <- file.path(path_res, "PCA_uncorrected")
+setwd(path_PCA_un)
+
+png("elbow_plot_PCA_un.png", width = 900, height = 600)
+elbow_plt_all
+dev.off()
+
+png("all_PCs_un.png", width = 900, height = 600)
+all_PC_all
+dev.off()
+
+png("PC1_vs_PC2_un.png", width = 900, height = 600)
+PC1_PC2_all
+dev.off()
+```
+
+##PCA corrected
+```{r}
+path_PCA_cor <- file.path(path_res, "PCA_corrected")
+setwd(path_PCA_cor)
+
+png("elbow_plot_PCA_cor.png", width = 900, height = 600)
+elbow_plt_cor
+dev.off()
+
+png("all_PCs_cor.png", width = 900, height = 600)
+all_PC_cor
+dev.off()
+
+png("PC1_vs_PC2_cor.png", width = 900, height = 600)
+PC1_PC2_cor
+dev.off()
+
+png("all_PCs_cor_state.png", width = 900, height = 600)
+all_PC_state
+dev.off()
+
+png("PC1_vs_PC2_cor_state.png", width = 900, height = 600)
+PC1_PC2_state
+dev.off()
+
+png("all_PCs_cor_timepoint.png", width = 900, height = 600)
+all_PC_time
+dev.off()
+
+png("PC1_vs_PC2_cor_state.png", width = 900, height = 600)
+PC1_PC2_time
+dev.off()
+```
+
+#PCA outliers
+```{r}
+path_PCA_out <- file.path(path_res, "PCA_outlier")
+setwd(path_PCA_out)
+
+png("all_PCs_out.png", width = 900, height = 600)
+all_PC_out
+dev.off()
+
+png("PC1_vs_PC2_out.png", width = 900, height = 600)
+PC1_PC2_out
+dev.off()
+```
+#Differential gene analysis
+```{r}
+path_Deg_Path <- file.path(path_res, "Differential_gene_analysis_pathway_analysis")
+setwd(path_Deg_Path)
+
+png("vol_lesional_vs_non-lesional_base.png", width = 900, height = 600)
+deg_b_vol
+dev.off()
+
+png("vol_baseline_vs_treatment_lesional.png", width = 900, height = 600)
+deg_l_vol
+dev.off()
+
+png("vol_baseline_vs_treatment_non-lesional.png", width = 900, height = 600)
+deg_l_vol
+dev.off()
+
+png("vol_healthy_vs_AD.png", width = 900, height = 600)
+deg_hb_vol
+dev.off()
+```
+
+#Treatment assesment
+```{r}
+path_treat <- file.path(path_res, "Treatment_assesment")
+setwd(path_treat)
+
+png("top_20_genes.png", width = 900, height = 600)
+top_20_plt
+dev.off()
+
+png("elbow_plot_PCA_treat.png", width = 900, height = 600)
+elbow_plt_cor
+dev.off()
+
+png("all_PCs_treat.png", width = 900, height = 600)
+all_PC_cor
+dev.off()
+
+png("PC1_vs_PC2_treat.png", width = 900, height = 600)
+PC1_PC2_cor
+dev.off()
+```
+
